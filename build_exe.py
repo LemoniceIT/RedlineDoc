@@ -48,6 +48,7 @@ def main():
 
     # Build the PyInstaller command
     cmd = [sys.executable, "-m", "PyInstaller"]
+    cmd.extend(["--collect-data", "customtkinter", "--collect-data", "tkinterdnd2"])
     if args.onefile:
         cmd.append("--onefile")
     if args.noconsole:

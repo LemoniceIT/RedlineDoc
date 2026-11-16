@@ -1,32 +1,22 @@
-"""
-Document text extraction and comparison logic for RedlineDoc.
-
-Extraction strategy (per requirements):
-    .doc   -> pywin32 (win32com.client, Word.Application COM)
-    .docx  -> python-docx
-    .pdf   -> pdfplumber
-
-Comparison:
-    difflib.HtmlDiff generates a temporary HTML report highlighting
-    differences, additions, and omissions relative to the original document.
-"""
+"""Extract comparable text blocks from Word and PDF documents."""
 
 from __future__ import annotations
-
-from i18n import t
 
 import difflib
 import os
 import tempfile
 import webbrowser
+from collections import Counter
 from dataclasses import dataclass
+from html import escape
 from pathlib import Path
+
+from comparison import Block, Comparison, compare
+from i18n import t
 
 
 @dataclass
 class ExtractOptions:
-    """Options controlling how document text is extracted."""
-
     ignore_formatting: bool = True
     ignore_images: bool = True
     ignore_header: bool = False
@@ -34,27 +24,33 @@ class ExtractOptions:
 
 
 class DocumentProcessor:
-    """Extracts text from supported documents and compares two texts."""
-
     def __init__(self, log_callback=None) -> None:
         self._log = log_callback or (lambda _msg: None)
 
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
+    @staticmethod
+    def extract_blocks(file_path: str | Path, options: ExtractOptions) -> list[Block]:
+        path = Path(file_path)
+        extension = path.suffix.lower()
+        extractors = {
+            ".docx": DocumentProcessor._extract_docx,
+            ".doc": DocumentProcessor._extract_doc,
+            ".pdf": DocumentProcessor._extract_pdf,
+        }
+        if extension not in extractors:
+            raise ValueError(t("doc.unsupported_format").format(ext=extension))
+        return extractors[extension](path, options)
 
     @staticmethod
     def extract_text(file_path: str | Path, options: ExtractOptions) -> str:
-        """Extract plain text from a document according to *options*."""
-        ext = Path(file_path).suffix.lower()
-        if ext == ".docx":
-            return DocumentProcessor._extract_docx(file_path, options)
-        elif ext == ".doc":
-            return DocumentProcessor._extract_doc(file_path, options)
-        elif ext == ".pdf":
-            return DocumentProcessor._extract_pdf(file_path, options)
-        else:
-            raise ValueError(t("doc.unsupported_format").format(ext=ext))
+        return "\n".join(
+            block.text for block in DocumentProcessor.extract_blocks(file_path, options)
+        )
+
+    @staticmethod
+    def review(original: Path, modified: Path, options: ExtractOptions) -> Comparison:
+        left = DocumentProcessor.extract_blocks(original, options)
+        right = DocumentProcessor.extract_blocks(modified, options)
+        return compare(left, right, original.name, modified.name)
 
     @staticmethod
     def compare_documents(
@@ -64,211 +60,187 @@ class DocumentProcessor:
         to_desc: str | None = None,
         output_path: str | None = None,
     ) -> str:
-        """
-        Produce an HTML diff report via difflib.HtmlDiff and return the file path.
-
-        The report is written to *output_path* (or a temporary file) and can be
-        opened in the default browser by the caller.
-        """
-        if from_desc is None:
-            from_desc = t("doc.original")
-        if to_desc is None:
-            to_desc = t("doc.modified")
-
-        diff = difflib.HtmlDiff(wrapcolumn=88)
-
-        original_lines = original_text.splitlines()
-        modified_lines = modified_text.splitlines()
-
-        html_content = diff.make_file(
-            original_lines,
-            modified_lines,
-            fromdesc=from_desc,
-            todesc=to_desc,
+        """Generate the legacy HTML line diff for callers that supply plain text."""
+        content = difflib.HtmlDiff(wrapcolumn=88).make_file(
+            original_text.splitlines(),
+            modified_text.splitlines(),
+            fromdesc=escape(t("doc.original") if from_desc is None else from_desc),
+            todesc=escape(t("doc.modified") if to_desc is None else to_desc),
             context=True,
         )
-
         if output_path is None:
-            fd, output_path = tempfile.mkstemp(
-                suffix=".html", prefix="sd_diff_report_", text=True
-            )
+            fd, output_path = tempfile.mkstemp(suffix=".html", prefix="sd_diff_report_")
             os.close(fd)
-
-        with open(output_path, "w", encoding="utf-8") as f:
-            f.write(html_content)
-
+        Path(output_path).write_text(content, encoding="utf-8")
         return output_path
 
     @staticmethod
     def open_in_browser(file_path: str | Path) -> None:
-        """Open an HTML file in the default browser."""
-        webbrowser.open(f"file://{Path(file_path).resolve()}")
-
-    # ------------------------------------------------------------------
-    # .docx extraction (python-docx)
-    # ------------------------------------------------------------------
+        webbrowser.open(Path(file_path).resolve().as_uri())
 
     @staticmethod
-    def _extract_docx(file_path: str | Path, options: ExtractOptions) -> str:
+    def _extract_docx(path: Path, options: ExtractOptions) -> list[Block]:
         from docx import Document
+        from docx.table import Table
 
-        doc = Document(str(file_path))
-        chunks: list[str] = []
+        doc = Document(str(path))
 
-        # Body paragraphs
-        for para in doc.paragraphs:
-            text = para.text.strip()
-            if text:
-                chunks.append(text)
+        def blocks(container, kind="paragraph"):
+            for item in container.iter_inner_content():
+                if isinstance(item, Table):
+                    for row in item.rows:
+                        cells = {cell._tc: cell for cell in row.cells}
+                        text = " | ".join(
+                            " ".join(block.text for block in blocks(cell))
+                            for cell in cells.values()
+                        )
+                        if text.strip(" |"):
+                            yield Block(text, "table" if kind == "paragraph" else kind)
+                elif item.text.strip():
+                    yield Block(item.text, kind)
 
-        # Table cell paragraphs
-        for table in doc.tables:
-            for row in table.rows:
-                for cell in row.cells:
-                    for para in cell.paragraphs:
-                        text = para.text.strip()
-                        if text:
-                            chunks.append(text)
-
-        # Headers (included only when ignore_header is False)
-        if not options.ignore_header:
+        def margins(kind):
+            seen = set()
             for section in doc.sections:
-                for para in section.header.paragraphs:
-                    text = para.text.strip()
-                    if text:
-                        chunks.append(f"{t('doc.header_tag')} {text}")
-                for para in section.first_page_header.paragraphs:
-                    text = para.text.strip()
-                    if text:
-                        chunks.append(f"{t('doc.header_tag')} {text}")
+                for prefix in ("", "first_page_", "even_page_"):
+                    story = getattr(section, prefix + kind)
+                    if story.is_linked_to_previous or story.part in seen:
+                        continue
+                    seen.add(story.part)
+                    yield from blocks(story, kind)
 
-        # Footers (included only when ignore_footer is False)
-        if not options.ignore_footer:
-            for section in doc.sections:
-                for para in section.footer.paragraphs:
-                    text = para.text.strip()
-                    if text:
-                        chunks.append(f"{t('doc.footer_tag')} {text}")
-                for para in section.first_page_footer.paragraphs:
-                    text = para.text.strip()
-                    if text:
-                        chunks.append(f"{t('doc.footer_tag')} {text}")
-
-        return "\n".join(chunks)
-
-    # ------------------------------------------------------------------
-    # .doc extraction (pywin32 / win32com)
-    # ------------------------------------------------------------------
+        headers = [] if options.ignore_header else list(margins("header"))
+        footers = [] if options.ignore_footer else list(margins("footer"))
+        return [*headers, *blocks(doc), *footers]
 
     @staticmethod
-    def _extract_doc(file_path: str | Path, options: ExtractOptions) -> str:
-        import win32com.client
+    def _extract_doc(path: Path, options: ExtractOptions) -> list[Block]:
+        import pythoncom
+        from win32com.client import DispatchEx
 
-        # Word header/footer story-type constants
-        WD_HEADER_FOOTER_PRIMARY = 1
-        WD_HEADER_FOOTER_FIRST_PAGE = 2
-        WD_HEADER_FOOTER_EVEN_PAGES = 3
+        def margins(doc, collection, kind):
+            seen = set()
+            for section in doc.Sections:
+                for index in (1, 2, 3):
+                    story = getattr(section, collection)(index)
+                    text = story.Range.Text.strip() if story.Exists else ""
+                    if text and text not in seen:
+                        seen.add(text)
+                        yield Block(text, kind)
 
-        word = win32com.client.Dispatch("Word.Application")
-        word.Visible = False
-        word.DisplayAlerts = False
-
-        # Use absolute path — Word COM resolves relative paths against its
-        # own default documents directory, which causes silent failures.
-        abs_path = str(Path(file_path).resolve())
-        doc = word.Documents.Open(abs_path, ReadOnly=True, Visible=False)
+        pythoncom.CoInitialize()
         try:
-            chunks: list[str] = []
+            word = DispatchEx("Word.Application")
+            update_links = None
+            try:
+                word.Visible = False
+                word.DisplayAlerts = 0
+                word.AutomationSecurity = 3  # msoAutomationSecurityForceDisable
+                update_links = word.Options.UpdateLinksAtOpen
+                word.Options.UpdateLinksAtOpen = False
+                doc = word.Documents.Open(
+                    str(path.resolve()), ReadOnly=True, AddToRecentFiles=False,
+                    Visible=False, ConfirmConversions=False, NoEncodingDialog=True,
+                )
+                try:
+                    body = []
+                    row_end = -1
+                    for paragraph in doc.Content.Paragraphs:
+                        rng = paragraph.Range
+                        if rng.Start < row_end:
+                            continue
+                        if rng.Information(12):  # wdWithInTable
+                            try:
+                                row = rng.Rows(1)
+                                row_end = row.Range.End
+                                cells = [cell.Range.Text.rstrip("\r\x07") for cell in row.Cells]
+                            except pythoncom.com_error:
+                                # Word disallows row indexing in some merged tables.
+                                row_end = -1
+                                cells = [rng.Text.rstrip("\r\x07")]
+                            if any(cell.strip() for cell in cells):
+                                body.append(Block(" | ".join(cells), "table"))
+                        else:
+                            text = rng.Text.rstrip("\r")
+                            if text.strip():
+                                body.append(Block(text))
 
-            # Main story (body) text
-            story_text = doc.Content.Text.strip()
-            if story_text:
-                chunks.append(story_text)
-
-            section_count = doc.Sections.Count
-
-            # Headers (included only when ignore_header is False)
-            if not options.ignore_header:
-                for i in range(section_count):
-                    section = doc.Sections(i + 1)
-                    for hf_type in (
-                        WD_HEADER_FOOTER_PRIMARY,
-                        WD_HEADER_FOOTER_FIRST_PAGE,
-                        WD_HEADER_FOOTER_EVEN_PAGES,
-                    ):
-                        try:
-                            rng = section.Headers(hf_type).Range
-                            text = rng.Text.strip()
-                            if text:
-                                chunks.append(f"{t('doc.header_tag')} {text}")
-                        except Exception:  # noqa: BLE001, S110
-                            pass
-
-            # Footers (included only when ignore_footer is False)
-            if not options.ignore_footer:
-                for i in range(section_count):
-                    section = doc.Sections(i + 1)
-                    for hf_type in (
-                        WD_HEADER_FOOTER_PRIMARY,
-                        WD_HEADER_FOOTER_FIRST_PAGE,
-                        WD_HEADER_FOOTER_EVEN_PAGES,
-                    ):
-                        try:
-                            rng = section.Footers(hf_type).Range
-                            text = rng.Text.strip()
-                            if text:
-                                chunks.append(f"{t('doc.footer_tag')} {text}")
-                        except Exception:  # noqa: BLE001, S110
-                            pass
-
-            return "\n".join(chunks)
+                    headers = [] if options.ignore_header else list(margins(doc, "Headers", "header"))
+                    footers = [] if options.ignore_footer else list(margins(doc, "Footers", "footer"))
+                    return [*headers, *body, *footers]
+                finally:
+                    doc.Close(SaveChanges=0)
+            finally:
+                try:
+                    if update_links is not None:
+                        word.Options.UpdateLinksAtOpen = update_links
+                finally:
+                    word.Quit(SaveChanges=0)
         finally:
-            doc.Close(SaveChanges=False)
-            word.Quit()
-
-    # ------------------------------------------------------------------
-    # .pdf extraction (pdfplumber)
-    # ------------------------------------------------------------------
+            pythoncom.CoUninitialize()
 
     @staticmethod
-    def _extract_pdf(file_path: str | Path, options: ExtractOptions) -> str:
+    def _extract_pdf(path: Path, options: ExtractOptions) -> list[Block]:
         import pdfplumber
 
-        chunks: list[str] = []
-
-        with pdfplumber.open(str(file_path)) as pdf:
+        pages = []
+        repeated = Counter()
+        with pdfplumber.open(path) as pdf:
             for page in pdf.pages:
-                page_width = page.width or 0
-                page_height = page.height or 0
-
-                top_crop = 0.0
-                bottom_crop = 0.0
-
-                # Crop header region (top 10% of page) if requested
-                if options.ignore_header and page_height > 0:
-                    top_crop = page_height * 0.10
-
-                # Crop footer region (bottom 10% of page) if requested
-                if options.ignore_footer and page_height > 0:
-                    bottom_crop = page_height * 0.10
-
-                if top_crop or bottom_crop:
-                    crop_box = (
-                        0,
-                        top_crop,
-                        page_width,
-                        page_height - bottom_crop,
+                tables = page.find_tables()
+                boxes = [table.bbox for table in tables]
+                lines = page.filter(
+                    lambda obj, boxes=boxes: obj["object_type"] != "char" or not any(
+                        x0 <= (obj["x0"] + obj["x1"]) / 2 <= x1
+                        and top <= (obj["top"] + obj["bottom"]) / 2 <= bottom
+                        for x0, top, x1, bottom in boxes
                     )
-                    cropped = page.crop(crop_box)
-                    text = cropped.extract_text()
+                ).extract_text_lines(return_chars=False)
+                items = []
+                page_margins = set()
+                for line in lines:
+                    text = line["text"]
+                    kind = ""
+                    if line["bottom"] <= page.bbox[1] + page.height * 0.10:
+                        kind = "header"
+                    elif line["top"] >= page.bbox[3] - page.height * 0.10:
+                        kind = "footer"
+                    if kind:
+                        page_margins.add((kind, " ".join(text.split())))
+                    items.append((line["top"], line["x0"], line["bottom"], text, kind))
+                repeated.update(page_margins)
+                for table in tables:
+                    x0, top, _, bottom = table.bbox
+                    for row in table.extract():
+                        text = " | ".join(" ".join((cell or "").split()) for cell in row)
+                        if text.strip(" |"):
+                            items.append((top, x0, bottom, text, "table"))
+                pages.append(sorted(items, key=lambda item: item[:2]))
+
+        headers, body, footers = [], [], []
+        emitted_margins = set()
+        for number, items in enumerate(pages, start=1):
+            paragraph = []
+            previous_bottom = None
+            for top, _, bottom, text, kind in items:
+                key = (kind, " ".join(text.split()))
+                if kind in {"header", "footer"} and repeated[key] >= 2:
+                    ignore = options.ignore_header if kind == "header" else options.ignore_footer
+                    if not ignore and key not in emitted_margins:
+                        (headers if kind == "header" else footers).append(Block(text, kind, number))
+                        emitted_margins.add(key)
+                    continue
+                if paragraph and (kind == "table" or top - previous_bottom > (bottom - top) * 0.9):
+                    body.append(Block("\n".join(paragraph), page=number))
+                    paragraph.clear()
+                if kind == "table":
+                    body.append(Block(text, kind, number))
                 else:
-                    text = page.extract_text()
+                    paragraph.append(text)
+                previous_bottom = bottom
+            if paragraph:
+                body.append(Block("\n".join(paragraph), page=number))
 
-                if text and text.strip():
-                    chunks.append(text.strip())
-
-        return "\n".join(chunks)
-
-
-if __name__ == "__main__":
-    print(t("doc.module_info"))
+        if not (headers or body or footers):
+            raise ValueError(t("review.empty_pdf").format(name=path.name))
+        return [*headers, *body, *footers]

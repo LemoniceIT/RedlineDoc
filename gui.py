@@ -1,26 +1,4 @@
-"""
-CustomTkinter Graphical User Interface for RedlineDoc.
-
-Features:
-- 1024x768 window, maximizable/fullscreen-capable, Cyberpunk/Matrix dark theme.
-- Two file-load buttons (Original Document / Modified Document) for
-  .doc, .docx, .pdf formats with extension-match validation.
-- Configuration panel modal with four checkboxes:
-    * Ignore formatting  (forced-on, disabled)
-    * Ignore images       (forced-on, disabled)
-    * Ignore header       (user-toggleable)
-    * Ignore footer       (user-toggleable)
-- Compare button: extracts text via pywin32 / python-docx / pdfplumber,
-  runs difflib.HtmlDiff, writes a temporary HTML report and opens it
-  in the default browser.
-- Read-only Log Terminal panel (replicated from reference BotMyPC style)
-  polling messages from a thread-safe queue.Queue.
-- Credits modal with developer attribution, library licenses, and the
-- Credits modal with developer attribution, library licenses, and MIT license
-  notice (attribution required, no warranty).
-- Multi-language support (EN, ES, FR, IT, DE) with live switching via header
-  dropdown – no restart required.
-"""
+"""CustomTkinter desktop interface for RedlineDoc."""
 
 from __future__ import annotations
 
@@ -32,6 +10,7 @@ from tkinter import filedialog
 
 import customtkinter as ctk
 
+from comparison import Comparison
 from config import (
     APP_AUTHOR,
     APP_DISPLAY_TITLE,
@@ -57,10 +36,14 @@ from config import (
     GUI_WARNING_COLOR,
     GUI_WIDTH,
     LICENSE_TYPE,
+    LOCAL_DATA_DIR,
+    SUPPORTED_EXTENSIONS,
     get_supported_filetypes,
 )
 from document_processor import DocumentProcessor, ExtractOptions
 from i18n import LANGUAGES, get_language, set_language, t
+from preferences import Preferences
+from review_window import ReviewWindow
 
 logger = logging.getLogger(APP_NAME)
 
@@ -79,6 +62,7 @@ class ConfigDialog(ctk.CTkToplevel):
         parent: ctk.CTk,
         var_ignore_header: ctk.BooleanVar,
         var_ignore_footer: ctk.BooleanVar,
+        on_apply,
     ) -> None:
         super().__init__(parent)
         self.title(t("config.title"))
@@ -148,6 +132,7 @@ class ConfigDialog(ctk.CTkToplevel):
         self.chk_images.pack(anchor="w", padx=16, pady=(4, 4))
 
         # Ignore header — user-toggleable
+        header = ctk.BooleanVar(value=var_ignore_header.get())
         self.chk_header = ctk.CTkCheckBox(
             chk_frame,
             text=t("config.ignore_header"),
@@ -156,11 +141,12 @@ class ConfigDialog(ctk.CTkToplevel):
             fg_color=GUI_ACCENT_COLOR,
             hover_color=GUI_ACCENT_HOVER,
             border_color=GUI_BORDER_COLOR,
-            variable=var_ignore_header,
+            variable=header,
         )
         self.chk_header.pack(anchor="w", padx=16, pady=(4, 4))
 
         # Ignore footer — user-toggleable
+        footer = ctk.BooleanVar(value=var_ignore_footer.get())
         self.chk_footer = ctk.CTkCheckBox(
             chk_frame,
             text=t("config.ignore_footer"),
@@ -169,7 +155,7 @@ class ConfigDialog(ctk.CTkToplevel):
             fg_color=GUI_ACCENT_COLOR,
             hover_color=GUI_ACCENT_HOVER,
             border_color=GUI_BORDER_COLOR,
-            variable=var_ignore_footer,
+            variable=footer,
         )
         self.chk_footer.pack(anchor="w", padx=16, pady=(4, 12))
 
@@ -190,6 +176,12 @@ class ConfigDialog(ctk.CTkToplevel):
         )
         cancel_btn.pack(side="left", padx=10)
 
+        def apply():
+            var_ignore_header.set(header.get())
+            var_ignore_footer.set(footer.get())
+            on_apply()
+            self.destroy()
+
         save_btn = ctk.CTkButton(
             btn_frame,
             text=t("btn.apply"),
@@ -199,7 +191,7 @@ class ConfigDialog(ctk.CTkToplevel):
             hover_color=GUI_ACCENT_HOVER,
             text_color="#000000",
             font=ctk.CTkFont(weight="bold"),
-            command=self.destroy,
+            command=apply,
         )
         save_btn.pack(side="left", padx=10)
 
@@ -310,20 +302,24 @@ class MainWindow(ctk.CTk):
         super().__init__()
 
         self.log_queue: queue.Queue[str] = queue.Queue()
-        self.processor = DocumentProcessor()
+        self._results: queue.Queue[tuple[Comparison | None, Path, Path]] = queue.Queue()
+        self._preferences_path = LOCAL_DATA_DIR / "preferences.json"
+        preferences = Preferences.load(self._preferences_path)
+        set_language(preferences.language)
 
         # File paths
         self.original_path: Path | None = None
         self.modified_path: Path | None = None
 
         # Extraction / comparison options
-        self.var_ignore_header = ctk.BooleanVar(value=False)
-        self.var_ignore_footer = ctk.BooleanVar(value=False)
+        self.var_ignore_header = ctk.BooleanVar(value=preferences.ignore_header)
+        self.var_ignore_footer = ctk.BooleanVar(value=preferences.ignore_footer)
 
         # Window settings — 1024x768, maximizable to fullscreen
         self.title(APP_DISPLAY_TITLE)
         self.geometry(f"{GUI_WIDTH}x{GUI_HEIGHT}")
         self.resizable(True, True)
+        self.minsize(700, 480)
         self.configure(fg_color=GUI_BG_COLOR)
 
         # Build UI layout
@@ -331,6 +327,7 @@ class MainWindow(ctk.CTk):
         self._build_controls()
         self._build_terminal()
         self._build_footer()
+        self._enable_drop()
 
         # Connect window close protocol
         self.protocol("WM_DELETE_WINDOW", self._on_window_close)
@@ -431,6 +428,8 @@ class MainWindow(ctk.CTk):
         file_row = ctk.CTkFrame(ctrl_frame, fg_color="transparent")
         file_row.pack(fill="x", padx=12, pady=12)
 
+        file_row.grid_columnconfigure(1, weight=1)
+
         # Original Document
         self.btn_original = ctk.CTkButton(
             file_row,
@@ -443,17 +442,17 @@ class MainWindow(ctk.CTk):
             font=ctk.CTkFont(family="Segoe UI", size=11, weight="bold"),
             command=self._load_original,
         )
-        self.btn_original.pack(side="left", padx=(4, 4))
+        self.btn_original.grid(row=0, column=0, padx=4, pady=3, sticky="w")
 
         self.lbl_original_path = ctk.CTkLabel(
             file_row,
             text=t("file.no_selection"),
             font=ctk.CTkFont(family="Consolas", size=10),
             text_color=GUI_MUTED_TEXT,
-            width=300,
+            anchor="w",
             justify="left",
         )
-        self.lbl_original_path.pack(side="left", padx=(0, 12))
+        self.lbl_original_path.grid(row=0, column=1, sticky="ew", padx=8)
 
         # Modified Document
         self.btn_modified = ctk.CTkButton(
@@ -467,17 +466,17 @@ class MainWindow(ctk.CTk):
             font=ctk.CTkFont(family="Segoe UI", size=11, weight="bold"),
             command=self._load_modified,
         )
-        self.btn_modified.pack(side="left", padx=(4, 4))
+        self.btn_modified.grid(row=1, column=0, padx=4, pady=3, sticky="w")
 
         self.lbl_modified_path = ctk.CTkLabel(
             file_row,
             text=t("file.no_selection"),
             font=ctk.CTkFont(family="Consolas", size=10),
             text_color=GUI_MUTED_TEXT,
-            width=300,
+            anchor="w",
             justify="left",
         )
-        self.lbl_modified_path.pack(side="left", padx=(0, 4))
+        self.lbl_modified_path.grid(row=1, column=1, sticky="ew", padx=8)
 
         # --- Action row ---
         action_row = ctk.CTkFrame(ctrl_frame, fg_color="transparent")
@@ -607,6 +606,16 @@ class MainWindow(ctk.CTk):
         if code and code != get_language():
             set_language(code)
             self._refresh_ui_texts()
+            self._save_preferences()
+
+    def _save_preferences(self):
+        preferences = Preferences(
+            get_language(), self.var_ignore_header.get(), self.var_ignore_footer.get(),
+        )
+        try:
+            preferences.save(self._preferences_path)
+        except OSError as exc:
+            self._log(t("review.preferences_error").format(error=exc))
 
     def _refresh_ui_texts(self) -> None:
         """Update every visible widget text to the current language."""
@@ -661,6 +670,15 @@ class MainWindow(ctk.CTk):
         if has_new:
             self.term_textbox.see("end")
         self.term_textbox.configure(state="disabled")
+        try:
+            result, original, modified = self._results.get_nowait()
+        except queue.Empty:
+            pass
+        else:
+            self._on_comparison_done()
+            if result is not None:
+                window = ReviewWindow(self, result, (original, modified))
+                window.lift()
         self.after(GUI_QUEUE_POLL_INTERVAL_MS, self._poll_queue)
 
     def _clear_terminal(self) -> None:
@@ -686,44 +704,62 @@ class MainWindow(ctk.CTk):
             label.configure(text=placeholder, text_color=GUI_MUTED_TEXT)
 
     def _load_original(self) -> None:
-        file_path = filedialog.askopenfilename(
-            parent=self,
-            title=t("file.dialog_original"),
-            filetypes=get_supported_filetypes(),
-        )
-        if file_path:
-            self.original_path = Path(file_path)
-            self._update_file_label(
-                self.lbl_original_path,
-                self.original_path,
-                t("file.no_selection"),
-            )
-            self._log(
-                t("file.loaded_original").format(path=self.original_path)
-            )
+        self._load_file("original")
 
     def _load_modified(self) -> None:
+        self._load_file("modified")
+
+    def _load_file(self, side: str) -> None:
         file_path = filedialog.askopenfilename(
             parent=self,
-            title=t("file.dialog_modified"),
+            title=t(f"file.dialog_{side}"),
             filetypes=get_supported_filetypes(),
         )
         if file_path:
-            self.modified_path = Path(file_path)
-            self._update_file_label(
-                self.lbl_modified_path,
-                self.modified_path,
-                t("file.no_selection"),
-            )
-            self._log(
-                t("file.loaded_modified").format(path=self.modified_path)
-            )
+            self._select_path(side, Path(file_path))
+
+    def _select_path(self, side: str, path: Path) -> None:
+        if path.suffix.lower() not in SUPPORTED_EXTENSIONS:
+            self._log(t("doc.unsupported_format").format(ext=path.suffix))
+            return
+        if not path.is_file():
+            self._log(t("review.missing_file").format(path=path))
+            return
+        setattr(self, f"{side}_path", path)
+        self._update_file_label(getattr(self, f"lbl_{side}_path"), path, t("file.no_selection"))
+        self._log(t(f"file.loaded_{side}").format(path=path))
+
+    def _enable_drop(self) -> None:
+        from tkinter import TclError
+
+        try:
+            from tkinterdnd2 import DND_FILES, TkinterDnD
+
+            TkinterDnD._require(self)
+        except (ImportError, RuntimeError, TclError):
+            self._log(t("review.drop_unavailable"))
+            return
+
+        def drop(event, side):
+            paths = self.tk.splitlist(event.data)
+            if len(paths) == 1:
+                self._select_path(side, Path(paths[0]))
+            else:
+                self._log(t("review.one_file"))
+            return "copy"
+
+        for side in ("original", "modified"):
+            label = getattr(self, f"lbl_{side}_path")
+            for widget in (label, *label.winfo_children()):
+                widget.drop_target_register(DND_FILES)
+                widget.dnd_bind("<<Drop>>", lambda event, side=side: drop(event, side))
 
     def _open_config_dialog(self) -> None:
         ConfigDialog(
             self,
             var_ignore_header=self.var_ignore_header,
             var_ignore_footer=self.var_ignore_footer,
+            on_apply=self._save_preferences,
         )
 
     def _open_credits_dialog(self) -> None:
@@ -743,17 +779,6 @@ class MainWindow(ctk.CTk):
             self._log(t("compare.both_required"))
             return
 
-        ext_orig = self.original_path.suffix.lower()
-        ext_mod = self.modified_path.suffix.lower()
-
-        if ext_orig != ext_mod:
-            self._log(
-                t("compare.ext_mismatch").format(
-                    ext1=ext_orig, ext2=ext_mod
-                )
-            )
-            return
-
         options = self._get_extract_options()
         self._log(
             t("compare.options").format(
@@ -771,40 +796,23 @@ class MainWindow(ctk.CTk):
         )
 
         thread = threading.Thread(
-            target=self._run_comparison, args=(options,), daemon=True
+            target=self._run_comparison,
+            args=(self.original_path, self.modified_path, options),
+            daemon=True,
         )
         thread.start()
 
-    def _run_comparison(self, options: ExtractOptions) -> None:
-        """Background worker: extract text, compare, generate report, open browser."""
+    def _run_comparison(self, original: Path, modified: Path, options: ExtractOptions) -> None:
+        """Send the review result back to the UI thread."""
+        result = None
         try:
-            self._log(t("compare.start_original"))
-            orig_text = DocumentProcessor.extract_text(self.original_path, options)
-            self._log(
-                t("compare.done_chars").format(count=len(orig_text))
-            )
-
-            self._log(t("compare.start_modified"))
-            mod_text = DocumentProcessor.extract_text(self.modified_path, options)
-            self._log(
-                t("compare.done_chars").format(count=len(mod_text))
-            )
-
-            self._log(t("compare.generating"))
-            report_path = DocumentProcessor.compare_documents(orig_text, mod_text)
-            self._log(
-                t("compare.report_generated").format(path=report_path)
-            )
-
-            self._log(t("compare.opening_browser"))
-            DocumentProcessor.open_in_browser(report_path)
-
-            self._log(t("compare.completed"))
+            result = DocumentProcessor.review(original, modified, options)
+            self._log(t("review.completed"))
         except Exception as exc:
             self._log(t("compare.error").format(error=exc))
             logger.exception("Comparison failed")
         finally:
-            self._on_comparison_done()
+            self._results.put((result, original, modified))
 
     def _on_comparison_done(self) -> None:
         """Re-enable UI controls after the background thread finishes."""

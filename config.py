@@ -12,11 +12,12 @@ import sys
 from pathlib import Path
 
 from i18n import t
+from version import __version__
 
 # Application Metadata
 APP_NAME: str = "RedlineDoc"
 APP_DISPLAY_TITLE: str = "RedlineDoc"
-APP_VERSION: str = "1.0.0"
+APP_VERSION: str = __version__
 APP_AUTHOR: str = "Stefano D'Angelo"
 
 # License information
@@ -38,7 +39,6 @@ ICON_PATH: Path = ASSETS_DIR / "app_icon.ico"
 
 # Local user data directory: %LOCALAPPDATA%\RedlineDoc
 LOCAL_DATA_DIR: Path = Path(os.environ.get("LOCALAPPDATA", Path.home())) / APP_NAME
-LOCAL_DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 LOG_FILE_PATH: Path = LOCAL_DATA_DIR / "redline_doc.log"
 
@@ -76,6 +76,7 @@ SUPPORTED_EXTENSIONS: tuple[str, ...] = (".doc", ".docx", ".pdf")
 def get_supported_filetypes() -> list[tuple[str, str]]:
     """Return translated file-type filter list for file dialogs."""
     return [
+        (t("review.all_files"), "*.doc *.docx *.pdf"),
         (t("filetype.doc"), "*.doc"),
         (t("filetype.docx"), "*.docx"),
         (t("filetype.pdf"), "*.pdf"),
